@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+
+import numpy as np
+from einops import rearrange
 
 import warnings
 import math
 
 from utils import coords_to_sinusoidals, multiply_as_convex, create_linspace
-from .stylegan import EqualLinear, ConstantInput
+from .stylegan import EqualLinear, ConstantInput, LipEqualLinear
 from .spatialstylegan import SpatialToRGB, SpatialStyledConv
 
 
@@ -15,10 +19,8 @@ def custom_activation(x):
     x = x / (x + 1.)
     return x
 
-
 def custom_activation2(x):
     return torch.tanh(torch.relu(x))
-
 
 def custom_composite(shapes, depths, temperature=1.0):
     """
@@ -57,14 +59,22 @@ def custom_composite(shapes, depths, temperature=1.0):
     masks = unnormalized_masks / (torch.sum(unnormalized_masks, dim=-1, keepdim=True) + 1e-6)
     return masks
 
-
 def reparametrize_trick(mean, logvar):
     std = torch.exp(0.5 * logvar)
     eps = torch.randn_like(std)
     z = eps * std + mean
     return z
 
-
+def ease_function(x, min_threshold, max_threshold):
+    x = x.double()
+    x = (x - min_threshold) / (max_threshold - min_threshold)
+    return torch.where(
+        x < 0, 0.0, 
+        torch.where(
+            x > 1, 1.0, 
+            -(torch.cos(np.pi * x) - 1.0) / 2.0
+        )
+    )
 ######## Planners ##############
 
 class ActionDistribution:
@@ -192,7 +202,9 @@ class PlannerMLP(nn.Module):
             EqualLinear(self.hidden_dim, self.hidden_dim, lr_mul=0.01, activation='fused_lrelu'),
             EqualLinear(self.hidden_dim, self.hidden_dim, lr_mul=0.01, activation='fused_lrelu'),
             EqualLinear(self.hidden_dim, self.hidden_dim, lr_mul=0.01, activation='fused_lrelu'),
-            EqualLinear(self.hidden_dim, self.output_dim, lr_mul=0.01, activation=None),
+            EqualLinear(self.hidden_dim, self.hidden_dim, lr_mul=0.01, activation='fused_lrelu'),
+            EqualLinear(self.hidden_dim, self.hidden_dim, lr_mul=0.01, activation='fused_lrelu'),
+            EqualLinear(self.hidden_dim, self.output_dim, lr_mul=0.01, activation='fused_lrelu'),
         )
 
     def forward(self, c):
@@ -373,6 +385,210 @@ class CoordinateDecoder(nn.Module):
 
         return output
 
+
+class StarCoordinateDecoder(nn.Module):
+    def __init__(self, 
+        cond_dim, out_dim,
+        num_coords=2, num_sinusoidals=8,
+        min_radius=0.3, max_radius=1, 
+        progressive=True,
+    ):
+        super().__init__()
+
+        self.cond_dim = cond_dim
+
+        self.out_dim = out_dim
+
+        self.num_coords = num_coords
+        self.num_sinusoidals = num_sinusoidals
+        # 0 -> Everything locked, 1 -> Everything unlocked
+        self.register_buffer("freq_unlock", torch.zeros(1))
+
+        self.min_r = min_radius
+        self.max_r = max_radius
+
+        if self.num_sinusoidals > 0:
+            self.input_dim = 2 * (self.num_coords - 1) * self.num_sinusoidals + self.cond_dim
+        else:
+            self.input_dim = 2 * (self.num_coords - 1) + self.cond_dim
+        
+        self.module = nn.ModuleList([
+            EqualLinear(self.input_dim, 64, activation='fused_lrelu'),
+            EqualLinear(64 + self.cond_dim, 64, activation='fused_lrelu'),
+            EqualLinear(64 + self.cond_dim, 64, activation='fused_lrelu'),
+            EqualLinear(64 + self.cond_dim, self.out_dim, activation=None),
+        ])
+
+        self.progressive = progressive
+
+    def step(self, increment):
+        self.freq_unlock += increment
+        self.freq_unlock = torch.clamp(self.freq_unlock, 0, 1)
+    
+    def forward(self, coords, c):
+        original_c = c
+
+        # Normalize coords to have length of sqrt(d)
+        normalized_coords = coords * torch.rsqrt(coords.pow(2).mean([-1], keepdim=True) + 1e-8)
+        thetas = torch.cat([
+            torch.atan2(normalized_coords[..., i:i+1], normalized_coords[..., -1:])
+            for i in range(self.num_coords - 1)
+        ], dim=-1) / np.pi
+        
+        # Apply positional embeddings to the thetas
+        if self.num_sinusoidals > 0:
+            embedded_thetas = coords_to_sinusoidals(
+                thetas, num_sinusoidals=self.num_sinusoidals, multiplier=2, freq_type='mult'
+            )
+
+            # Progressive frequency encoding
+            if self.progressive:
+                limits = (torch.arange(0, self.num_sinusoidals).to(coords.device) / (self.num_sinusoidals))  # [0/n, 1/n, ..., (n-1)/n]
+                weights = torch.clamp((self.freq_unlock - limits) * (self.num_sinusoidals), 0.0, 1.0)
+                expanded_weights = weights[:, None].expand(-1, 2 * (self.num_coords - 1)).flatten()
+                embedded_thetas = embedded_thetas * expanded_weights[(None,) * (coords.dim() - 1)]
+        else:
+            embedded_thetas = coords_to_sinusoidals(
+                thetas, num_sinusoidals=1, multiplier=2, freq_type='mult'
+            )
+
+        # Passing through the module
+        c = c[..., None, None, :].expand(*((-1,) * (c.dim() - 1)), embedded_thetas.shape[-3], embedded_thetas.shape[-2], -1)
+        output_shape = embedded_thetas.shape[:-1]
+        output = embedded_thetas.flatten(end_dim=-2)
+        c = c.flatten(end_dim=-2)
+        
+        for i, layer in enumerate(self.module):
+            output = torch.cat([output, c], dim=-1)
+            output = layer(output)
+        output = output.view(*output_shape, -1)
+        dist_to_border = torch.clamp(output, self.min_r, self.max_r) # [...., out_dim]
+        
+        # Compute the radius of the coords
+        radius = coords.pow(2).sum(dim=-1, keepdim=True).sqrt()
+        output = ease_function(dist_to_border - radius, -0.5, 0).float()
+
+        try:
+            theta_grads = torch.autograd.grad(outputs=dist_to_border.sum(), inputs=thetas, create_graph=True, only_inputs=True)[0]
+            cond_grads = torch.autograd.grad(outputs=dist_to_border.mean((-2, -3)).sum(), inputs=original_c, create_graph=True, only_inputs=True)[0]
+        except RuntimeError:
+            theta_grads = None 
+            cond_grads = None
+
+        return output, (theta_grads, cond_grads)
+
+    
+class ICouplingBlock(nn.Module):
+    def __init__(
+        self, cond_dim, num_coords=2,
+        hidden_dim=128, num_sinusoidals=2, proj_dim=128,
+    ):
+        super().__init__()
+        
+        self.cond_dim = cond_dim
+        self.num_coords = num_coords
+        self.hidden_dim = hidden_dim
+        
+        self.num_sinusoidals = num_sinusoidals
+        self.proj_dim = proj_dim
+        self.coord_input_dim = self.proj_dim if self.num_sinusoidals == 0 else 2 * self.num_sinusoidals
+        
+        self.x_proj = nn.Sequential(
+            nn.Linear(1, 2 * self.proj_dim),
+            nn.ReLU(),
+            nn.Linear(2 * self.proj_dim, self.proj_dim)
+        )
+
+        self.x_module = nn.Sequential(
+            nn.Linear(self.coord_input_dim + self.cond_dim, self.hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.hidden_dim, 2),
+        )
+        
+        self.y_proj = nn.Sequential(
+            nn.Linear(1, 2 * self.proj_dim),
+            nn.ReLU(),
+            nn.Linear(2 * self.proj_dim, self.proj_dim)
+        )
+        self.y_module = nn.Sequential(
+            nn.Linear(self.coord_input_dim + self.cond_dim, self.hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.hidden_dim, 2)
+        )
+        
+        self.hardtanh = nn.Hardtanh(min_val=-2, max_val=2)
+
+    def forward(self, coords, c):
+        x = coords[..., 0:1]
+        y = coords[..., 1:2]
+        
+        # Apply x
+        x_input = self.x_proj(x) if self.num_sinusoidals == 0 else coords_to_sinusoidals(x / 2 ** (self.num_sinusoidals - 1), num_sinusoidals=self.num_sinusoidals, multiplier=2, freq_type='mult')
+        y_log_scale, y_bias = self.x_module(torch.cat([x_input, c], dim=-1)).chunk(2, dim=-1)
+        y_log_scale = self.hardtanh(y_log_scale)
+        y = y * torch.exp(y_log_scale) + y_bias
+
+        # Apply y
+        y_input = self.y_proj(y) if self.num_sinusoidals == 0 else coords_to_sinusoidals(y / 2 ** (self.num_sinusoidals - 1), num_sinusoidals=self.num_sinusoidals, multiplier=2, freq_type='mult')
+        x_log_scale, x_bias = self.y_module(torch.cat([y_input, c], dim=-1)).chunk(2, dim=-1)
+        x_log_scale = self.hardtanh(x_log_scale)
+        x = x * torch.exp(x_log_scale) + x_bias
+
+        return torch.cat([x, y], dim=-1), (x_log_scale + y_log_scale)
+
+class CoordinateDeformer(nn.Module):
+    def __init__(self, 
+        cond_dim, num_coords, deform_block, num_blocks=3
+    ):
+        super().__init__()
+
+        self.cond_dim = cond_dim
+        self.num_coords = num_coords
+        self.num_blocks = num_blocks
+
+        self.deformations = nn.ModuleList(
+            [deform_block(self.cond_dim, self.num_coords) for _ in range(self.num_blocks)]
+        )
+    
+    def step(self, increment):
+        pass
+
+    def forward(self, coords, c):
+        initial_coords = coords
+        original_c = c
+        
+        # Passing through the module
+        c = c[..., None, None, :].expand(*((-1,) * (c.dim() - 1)), coords.shape[-3], coords.shape[-2], -1)
+        coords_shape = coords.shape[:-1] 
+        coords = coords.flatten(end_dim=-2)
+        c = c.flatten(end_dim=-2)
+        
+        log_jacobian = 0
+        zero_coords = torch.zeros(*original_c.shape[:-1], 2, device=c.device)
+        for _, layer in enumerate(self.deformations):
+            coords, layer_log_jacobian = layer(coords, c)
+            log_jacobian += layer_log_jacobian
+            
+            zero_coords, _ = layer(zero_coords, original_c)
+        
+        coords = coords.view(*coords_shape, -1)
+        coords = coords - zero_coords[..., None, None, :]
+
+        # Compute the radius of the coords
+        radius = coords.pow(2).sum(dim=-1, keepdim=True).sqrt()
+        output = ease_function(1 - radius, -0.5, 0).float()
+        
+        output = output.view(*coords_shape, 1)
+        log_jacobian = log_jacobian.view(*coords_shape, 1)
+        
+
+        return output, (log_jacobian, coords, initial_coords)
+
+
 class SpriteAssembler(nn.Module):
     def __init__(
         self, 
@@ -408,10 +624,21 @@ class SpriteAssembler(nn.Module):
         # Sprite library
         self.shape_progressive = shape_progressive
         self.shape_num_sinusoidals = shape_num_sinusoidals
-        self.shape_library = CoordinateDecoder(
-            cond_dim=self.shape_encoding_dim, out_dim=1, final_activation=nn.Sigmoid(), 
-            num_coords=2, num_sinusoidals=self.shape_num_sinusoidals, progressive=self.shape_progressive
+        # self.shape_library = StarCoordinateDecoder(
+        #     cond_dim=self.shape_encoding_dim, out_dim=1, num_coords=2, 
+        #     num_sinusoidals=self.shape_num_sinusoidals, progressive=self.shape_progressive,
+        #     min_radius=0.3, max_radius=1.2, 
+        # )
+        self.shape_library = CoordinateDeformer(
+            cond_dim=self.shape_encoding_dim, num_coords=2, 
+            deform_block=lambda x, y: ICouplingBlock(x, y, num_sinusoidals=self.shape_num_sinusoidals),
+            num_blocks=3
         )
+        # self.shape_library = CoordinateDecoder(
+        #     cond_dim=self.shape_encoding_dim, out_dim=1, final_activation=nn.Sigmoid(),
+        #     num_coords=2, num_sinusoidals=self.shape_num_sinusoidals, progressive=self.shape_progressive, 
+        #     radius_masking=True
+        # )
         
         # Texture library
         self.texture_progressive = texture_progressive
@@ -460,7 +687,7 @@ class SpriteAssembler(nn.Module):
         shape_aligned_coords = multiply_as_convex(shape_aligned_coords, shape_rs[:, :, None, None, :]) # rotate, scale     
 
         # Compute shape sprite
-        sprites = self.get_sprite(shape_aligned_coords, all_shapes_encodings)
+        sprites, extras = self.get_sprite(shape_aligned_coords, all_shapes_encodings)
         # # Area normalization
         # normal_area = 0.75
         # shape_area = sprites.mean((-3, -2))
@@ -477,17 +704,17 @@ class SpriteAssembler(nn.Module):
         # Compute masks
         masks = self.composite(sprites, all_shape_depths[..., 0])
         
-        return masks, sprites, textures
+        return masks, sprites, textures, extras
 
     def get_sprite(self, coords, cond):
-        sprite = self.shape_library(coords, cond)
+        sprite, extras = self.shape_library(coords, cond)
         
-        ### Enforce non-empty sprite
+        # ### Enforce non-empty sprite
         min_r = 0.3
         radius = ((coords ** 2).sum(dim=-1, keepdim=True)).sqrt()
         sprite = torch.clamp(sprite + torch.sigmoid((-radius + min_r) / min_r * 5), 1e-3, 1.0)
         
-        return sprite
+        return sprite, extras
 
     def get_texture(self, coords, cond):
         if self.use_textures:
@@ -495,7 +722,7 @@ class SpriteAssembler(nn.Module):
         else:
             texture = cond[..., None, None, :].expand(*(-1,) * (cond.dim() - 1), coords.shape[-3], coords.shape[-2], -1)
         
-        texture = texture * torch.rsqrt(texture.pow(2).mean([1], keepdim=True) + 1e-8)
+        # texture = texture * torch.rsqrt(texture.pow(2).mean([1], keepdim=True) + 1e-8)
         return texture
 
     def forward(self, bg_feat, actions, size=64):
@@ -520,63 +747,16 @@ class SpriteAssembler(nn.Module):
         actions = {x[0]: actions_partitioned[i] for i, x in enumerate(self.action_configs)}
         
         # Generate and composite shapes
-        masks, sprites, textures = self.compute_shapes(actions, coords)
+        masks, sprites, textures, extras = self.compute_shapes(actions, coords)
         
         # Combine features
         textures = torch.cat([textures, bg_texture.unsqueeze(-2)], dim=-2) # [batch_size, H, W, num_shapes+1, shape_style_dim]
         feature_map = (masks[..., None] * textures).sum(dim=-2) # [batch_size, H, W, shape_style_dim]
-        return feature_map, masks, sprites, textures, actions
 
-##################################
-
-######## Feature generators ########
-# TODO: Continue filling this 
-class FeatureGenerator1(nn.Module):
-    def __init__(
-        self, hidden_dim=64, hidden_action_dim=32, planner_type='mlp', num_actions=8,
-
-        shape_style_dim=32, shape_encoding_dim=8, 
-        shape_progressive=False, shape_num_sinusoidals=8, 
-        use_textures=True, texture_progressive=True, texture_num_sinusoidals=8,
-    ) -> None:
-        super().__init__()
-
-        self.hidden_action_dim = hidden_action_dim
-        self.hidden_dim = hidden_dim
-        self.num_actions = num_actions
-        self.shape_style_dim = shape_style_dim
-
-        if planner_type not in ['mlp', 'recurrent-1', 'recurrent-2', 'recurrent-3']:
-            raise ValueError(f"Planner type {planner_type} must be in ['mlp', 'recurrent-1', 'recurrent-2', 'recurrent-3']")
-        elif planner_type == 'mlp':
-            self.planner = PlannerMLP(self.hidden_dim, self.shape_style_dim, self.hidden_action_dim, self.num_actions)
-        elif planner_type == 'recurrent-1':
-            self.planner = PlannerRecurrent1(self.hidden_dim, self.shape_style_dim, self.hidden_action_dim, self.num_actions)
-        elif planner_type == 'recurrent-2':
-            self.planner = PlannerRecurrent2(self.hidden_dim, self.shape_style_dim, self.hidden_action_dim, self.num_actions)
-        elif planner_type == 'recurrent-3':
-            self.planner = PlannerRecurrent3(self.hidden_dim, self.shape_style_dim, self.hidden_action_dim, self.num_actions)
-
-
-        self.assembler = SpriteAssembler(
-            hidden_action_dim=self.hidden_action_dim,
-            shape_style_dim=shape_style_dim, 
-            shape_encoding_dim=shape_encoding_dim,
-            shape_progressive=shape_progressive, shape_num_sinusoidals=shape_num_sinusoidals, 
-            use_textures=use_textures, texture_progressive=texture_progressive, texture_num_sinusoidals=texture_num_sinusoidals,
+        return (
+            feature_map, 
+            {'masks': masks, 'sprites': sprites, 'textures': textures, 'actions': actions, 'extras': extras}
         )
-
-
-    def forward(self, c):
-        pass
-
-# TODO: Fill this to use the 2-linear representation for the sprites (the 2D version of tri-planar representations)
-class FeatureGenerator2(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, c):
-        pass
 
 ##################################
 
@@ -679,6 +859,11 @@ class StyleDecoder(nn.Module):
         randomize_noise=True,
         return_features=False
     ):
+        if noise == 'const':
+            noise = [
+                getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
+            ]
+        
         if noise is None:
             if randomize_noise:
                 noise = [None] * self.num_layers
@@ -690,10 +875,27 @@ class StyleDecoder(nn.Module):
         latent = [styles] * self.n_latent
         
         if self.const_in:
-            out = self.input(latent[0])
+            if isinstance(styles, dict):
+                out = self.input(latent[0]['textures'])
+            else:
+                out = self.input(latent[0])
         else:
-            out = F.interpolate(styles, (self.size_in, self.size_in), mode='bilinear', align_corners=False)
-        
+            if isinstance(styles, dict):
+                masks = styles['masks'] # [batch_size, H, W, num_shapes+1]
+                masks = F.interpolate(rearrange(masks, 'b H W s -> b s H W'), (self.size_in, self.size_in), mode='bilinear', align_corners=False)
+
+                textures = styles['textures'] # [batch_size, H, W, num_shapes+1, shape_style_dim]
+                num_textures = textures.shape[-2]
+                texture_dim = textures.shape[-1]
+                textures = F.interpolate(rearrange(textures, 'b H W s d -> b (s d) H W'), (self.size_in, self.size_in), mode='bilinear', align_corners=False)
+                textures = rearrange(textures, 'b (s d) H W -> b d s H W', s=num_textures, d=texture_dim)
+                
+                out = (masks[:, None] * textures).sum(dim=2)
+            else:
+                out = F.interpolate(styles, (self.size_in, self.size_in), mode='bilinear', align_corners=False)
+            
+            # out = out * torch.rsqrt(out.pow(2).mean([1], keepdim=True) + 1e-8)
+
         out = self.conv1(out, latent[0], noise=noise[0])
 
         self.outs = [out]
@@ -722,7 +924,6 @@ class StyleDecoder(nn.Module):
         else:
             return image, None
 
-
 class MultiShapeStyleLinearApproach(nn.Module):
     def __init__(
         self, hidden_dim=64, hidden_action_dim=32, planner_type='mlp', num_actions=8,
@@ -731,7 +932,7 @@ class MultiShapeStyleLinearApproach(nn.Module):
         shape_progressive=False, shape_num_sinusoidals=8, 
         use_textures=True, texture_progressive=True, texture_num_sinusoidals=8,
         
-        to_rgb_type='none', output_size=64, const_in=True, size_in=4,
+        to_rgb_type='none', output_size=64, const_in=True, size_in=4, c_model=32,
     ):
         super().__init__()
         
@@ -779,7 +980,7 @@ class MultiShapeStyleLinearApproach(nn.Module):
                 style_dim=self.shape_style_dim,
                 channel_multiplier=2,
                 c_out=3,
-                c_model=32,
+                c_model=c_model,
                 size_in=size_in,
                 const_in=const_in,
             )
@@ -794,31 +995,36 @@ class MultiShapeStyleLinearApproach(nn.Module):
         output = {}
         
         if len(action_list) > 0:
-            feature_map, masks, sprites, textures, actions = self.assembler(bg_feat, action_list, size)
-            output['masks'] = masks
-            output['sprites'] = sprites
-            output['textures'] = textures
-            output['actions'] = actions
+            feature_map, extra_outputs = self.assembler(bg_feat, action_list, size)
+            output.update(extra_outputs)
+            masks = output['masks']
+            textures = output['textures']
         else:
             feature_map = self.assembler(bg_feat, action_list, size)
+            textures = feature_map.unsqueeze(-2)
+            masks = torch.ones_like(textures[..., 0])
         
         # TODO: Fix this for non "styled" decoders !!!!!!
         feature_map = feature_map.permute(0, 3, 1, 2)
         output['features'] = feature_map
-        
+
         if render:
-            render = self.to_rgb(feature_map, noise=noise)
+            render = self.to_rgb(
+                {'textures': textures, 'masks': masks}, 
+                noise=noise,
+            )
             output['render'] = render
 
         return output
         
-    def decode(self, c, size, steps=3, render_every_step=False):
+    def decode(self, c, size, steps=3, noise=None, render_every_step=False):
         output = {}
         
         bg_feat, action_list = self.planner(c)
         output['bg_and_actions'] = torch.cat([bg_feat] + action_list, dim=-1)
         
-        noise = [torch.zeros_like(x) for x in self.to_rgb.get_noise_like()]
+        if noise is None:
+            noise = [torch.zeros_like(x) for x in self.to_rgb.get_noise_like()]
         
         for i in range(len(action_list) + 1):
             if not (render_every_step or i == len(action_list)):
@@ -830,47 +1036,55 @@ class MultiShapeStyleLinearApproach(nn.Module):
 
         return output
 
-    def forward(self, x, size, steps=3, mode='sample', render_every_step=False):        
+    def forward(self, x, size, steps=3, noise=None, mode='sample', render_every_step=False):        
         output = {}
         
+        if noise is None:
+             noise = [torch.zeros_like(x) for x in self.to_rgb.get_noise_like()]
+
         if mode == 'render':
             if x.dim() != 4 or x.shape[1] != self.shape_style_dim:
                 raise ValueError(f"The input shape isn't consistent with [batch_size, {self.shape_style_dim}, H, W]")
-            output['render'] = self.to_rgb(x)
+            output['render'] = self.to_rgb(x, noise=noise)
         elif mode == 'sample':
             c = torch.randn(x.shape[0], self.hidden_dim).to(x.device)
             output['random_sample'] = c
-            output.update(self.decode(c, size, steps=steps, render_every_step=render_every_step))
+            output.update(self.decode(c, size, steps=steps, noise=noise, render_every_step=render_every_step))
         elif mode == 'decode':
             if x.dim() != 2 or x.shape[-1] != self.hidden_dim:
                 raise Exception(f"The input shape isn't consistent with [batch_size, {self.hidden_dim}]. Input shape: {x.shape}")
             c = x
             output['decoded_sample'] = c
-            output.update(self.decode(c, size, steps=steps, render_every_step=render_every_step))
+            output.update(self.decode(c, size, steps=steps, noise=noise, render_every_step=render_every_step))
         
         return output
 
 class MyRegularizer(nn.Module):
-    def __init__(self, feature_dim, output_dim=3, final_activation=None, hidden_dim=64):
+    def __init__(self, feature_dim, noise_dim, output_dim=3, final_activation=None, hidden_dim=64):
         super().__init__()
         
         self.feature_dim = feature_dim
+        self.noise_dim = noise_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.final_activation = final_activation
         
         self.linear_estimator = nn.Sequential(
-            EqualLinear(self.feature_dim, self.hidden_dim, lr_mul=1, activation='fused_lrelu'),
+            EqualLinear(self.feature_dim + self.noise_dim, self.hidden_dim, lr_mul=1, activation='fused_lrelu'),
             EqualLinear(self.hidden_dim, self.output_dim, lr_mul=1, activation=None),
         )
     
-    def forward(self, features, render, mode='train'):
+    def forward(self, features, noise, render, mode='train'):
         if mode not in ['train', 'reg']:
             raise ValueError(f"Mode must be in ['train', 'reg']. Invalid value: {mode}")
         
-        features = F.interpolate(features, (render.shape[2], render.shape[3]), mode='bilinear').permute(0, 2, 3, 1)
-        features_shape = features.shape
-        linear_estimate = self.linear_estimator(features.flatten(end_dim=-2)).view(*features_shape[:-1], -1)
+        
+        features = F.interpolate(features, (render.shape[2], render.shape[3]), mode='bilinear')
+        noise = torch.cat([F.interpolate(x, (render.shape[2], render.shape[3]), mode='bilinear') for x in noise], dim=1)
+        inputs = torch.cat([features, noise], dim=1).permute(0, 2, 3, 1)
+        inputs_shape = inputs.shape
+        
+        linear_estimate = self.linear_estimator(inputs.flatten(end_dim=-2)).view(*inputs_shape[:-1], -1)
         if self.final_activation is not None:
             linear_estimate = self.final_activation(linear_estimate)
         linear_estimate = linear_estimate.permute(0, 3, 1, 2)
@@ -883,6 +1097,7 @@ class MyRegularizer(nn.Module):
             # Regularize (performed every n steps) / This loss must be given the generators inputs when calling backwards()
             reg_loss = F.mse_loss(linear_estimate.detach(), render) 
             return reg_loss
+
 
 
 

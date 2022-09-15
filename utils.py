@@ -388,13 +388,19 @@ class ScaleNorm(nn.Module):
         output = x * ((x ** 2).sum(dim=self.dim, keepdim=True) + 1e-6).rsqrt()
         return output
     
-def get_grad_norm(model):
-    total_norm = 0.0
-    for p in model.parameters():
-        param_norm = p.grad.detach().data.norm(2)
-        total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** 0.5
-    return total_norm
+def get_grad_norm(modules):
+    params = []
+    for module in modules:
+        params += [param for param in module.parameters() if param.grad is not None]
+    grad = torch.cat([param.grad.flatten() for param in params])
+    return torch.linalg.norm(grad)
+
+    # total_norm = 0.0
+    # for p in model.parameters():
+    #     param_norm = p.grad.detach().data.norm(2)
+    #     total_norm += param_norm.item() ** 2
+    # total_norm = total_norm ** 0.5
+    # return total_norm
 
 
 def requires_grad(model, flag=True):

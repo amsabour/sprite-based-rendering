@@ -13,20 +13,22 @@ import torchvision.transforms as transforms
 
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import copy
+import sys
 
 import math
 import time
 import gc
+import traceback
+
 
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-from networks.stylegan import StyleGANDiscriminator
+from networks.stylegan import LipEqualLinear, StyleGANDiscriminator
 from networks.custom_modules import MultiShapeStyleLinearApproach, MyRegularizer
 
 ################################################################################################################
@@ -64,6 +66,15 @@ def calc_pl_lengths(features, images):
     pl_grads = torch.autograd.grad(outputs=outputs, inputs=features, create_graph=True, only_inputs=True)[0] # [B, c, H, W]
     return pl_grads.square().sum((2, 3)).mean(dim=1).sqrt()
 
+def calc_pl_lengths_textures(textures, images):
+    num_pixels = images.shape[2] * images.shape[3]
+    pl_noise = torch.randn_like(images) / math.sqrt(num_pixels)
+    outputs = (images * pl_noise).sum()
+
+    pl_grads = torch.autograd.grad(outputs=outputs, inputs=textures, create_graph=True, only_inputs=True)[0] # [batch_size, H, W, num_shapes+1, shape_style_dim]
+    return pl_grads.square().sum((1, 2, 3)).mean(dim=1).sqrt()
+
+
 def generate_random_flip_signs(x, prob=0.1):
     return 1 - 2 * (torch.rand_like(x) < prob).float()
 
@@ -88,19 +99,23 @@ class MyLoss(nn.Module):
         self.discriminator = discriminator
         self.c = c
         self.pl_mean = torch.zeros([], device=c.device)
+        self.noise_generator = torch.randn if c.use_noise else torch.zeros
 
     def accumulate_gradients(self, phase, x, gain, log=True):
         assert phase in ['G', 'G_reg', 'D', 'D_reg']
+        batch_size = x.shape[0]
 
         if phase == "G":
-            generator_output = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, mode='sample')
+            input_noise = [self.noise_generator(batch_size, *_noise.shape[1:], device=self.c.device) for _noise in self.generator.to_rgb.get_noise_like()]
+            generator_output = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, noise=input_noise, mode='sample')
             samples = generator_output[f'renders/{self.c.steps}/render']
             features = generator_output[f'renders/{self.c.steps}/features']
 
             fake_pred = self.discriminator(samples)
             generator_gan_loss = F.softplus(-fake_pred).mean()
             my_regularizer_loss = self.my_regularizer(
-                F.interpolate(features, (self.c.G_args.output_size, self.c.G_args.output_size), mode='bilinear', align_corners=False).detach(), samples, 
+                F.interpolate(features, (self.c.G_args.output_size, self.c.G_args.output_size), mode='bilinear', align_corners=False).detach(), input_noise, 
+                samples, 
                 mode='train'
             ).mean()
             generator_loss = generator_gan_loss + my_regularizer_loss
@@ -116,7 +131,8 @@ class MyLoss(nn.Module):
             del generator_output, samples, features
 
         if phase == "G_reg":
-            generator_output = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, mode='sample')
+            input_noise = [self.noise_generator(batch_size, *_noise.shape[1:], device=self.c.device) for _noise in self.generator.to_rgb.get_noise_like()]
+            generator_output = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, noise=input_noise, mode='sample')
             regularization_loss = 0
             
             non_useless_loss = torch.zeros([], device=self.c.device)
@@ -149,7 +165,8 @@ class MyLoss(nn.Module):
                 samples = generator_output[f'renders/{self.c.steps}/render']
                 features = generator_output[f'renders/{self.c.steps}/features']
                 t1_loss = self.my_regularizer(
-                    F.interpolate(features, (self.c.G_args.output_size, self.c.G_args.output_size), mode='bilinear', align_corners=False).detach(), samples, 
+                    F.interpolate(features, (self.c.G_args.output_size, self.c.G_args.output_size), mode='bilinear', align_corners=False).detach(), input_noise, 
+                    samples, 
                     mode='reg'
                 ).mean()
                 regularization_loss += (t1_loss * self.c.t1_weight).mean()
@@ -159,14 +176,34 @@ class MyLoss(nn.Module):
             pl_lengths = torch.zeros([], device=self.c.device)
             if self.c.pl_weight > 0.0:
                 samples = generator_output[f'renders/{self.c.steps}/render']
-                features = generator_output[f'renders/{self.c.steps}/features']
+                textures = generator_output[f'renders/{self.c.steps}/textures']
                 
-                pl_lengths = calc_pl_lengths(features, samples)
+                pl_lengths = calc_pl_lengths_textures(textures, samples)
                 cur_pl_mean = self.pl_mean.lerp(pl_lengths.mean(), 0.01)
                 self.pl_mean.copy_(cur_pl_mean.detach())
                 pl_loss = (pl_lengths - self.pl_mean).square().mean()
                 regularization_loss += (pl_loss * self.c.pl_weight)
-                del samples, features
+                del samples, textures
+            
+            complexity_loss = torch.zeros([], device=self.c.device)
+            if self.c.complexity_weight > 0.0:
+                extras = generator_output[f'renders/{self.c.steps}/extras']
+                log_jacobian, warped_coords, non_warped_coords = extras
+                horizontal_smoothness_loss = (
+                    (torch.linalg.norm(warped_coords[..., :-1, :, :] - warped_coords[..., 1:, :, :], dim=-1) + 1e-6).log() - 
+                    (torch.linalg.norm(non_warped_coords[..., :-1, :, :] - non_warped_coords[..., 1:, :, :], dim=-1) + 1e-6).log()
+                ).abs().flatten(start_dim=1)
+
+                vertical_smoothness_loss = (
+                    (torch.linalg.norm(warped_coords[..., :, :-1, :] - warped_coords[..., :, 1:, :], dim=-1) + 1e-6).log() - 
+                    (torch.linalg.norm(non_warped_coords[..., :, :-1, :] - non_warped_coords[..., :, 1:, :], dim=-1) + 1e-6).log()
+                ).abs().flatten(start_dim=1)
+
+                horizontal_tops = torch.topk(horizontal_smoothness_loss, int(0.01 * horizontal_smoothness_loss.shape[-1]), dim=-1)[0]
+                vertical_tops = torch.topk(vertical_smoothness_loss, int(0.01 * vertical_smoothness_loss.shape[-1]), dim=-1)[0]
+                
+                complexity_loss = horizontal_tops.mean() + vertical_tops.mean() + log_jacobian.abs().mean()
+                regularization_loss += (complexity_loss * self.c.complexity_weight)
             
             if self.c.rank == 0 and log:
                 wandb.log({
@@ -175,15 +212,18 @@ class MyLoss(nn.Module):
                     'Non_empty_loss': non_empty_loss.item(),
                     'T1_loss': t1_loss.item(),
                     'Pl_loss': pl_loss.item(),
-                    'Pl_lengths': pl_lengths.mean()
+                    'Pl_lengths': pl_lengths.mean(),
+                    'Complexity_loss': complexity_loss.item(),
                 }, step=self.c.global_step, commit=False)
             
-            regularization_loss.mean().mul(gain).backward()
+            if regularization_loss != 0:
+                regularization_loss.mean().mul(gain).backward()
             del generator_output
 
         if phase == "D":
             with torch.no_grad():
-                samples = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, mode='sample')[f'renders/{self.c.steps}/render']
+                input_noise = [self.noise_generator(batch_size, *_noise.shape[1:], device=self.c.device) for _noise in self.generator.to_rgb.get_noise_like()]
+                samples = self.generator(x, self.c.feature_volume_size, steps=self.c.steps, noise=input_noise, mode='sample')[f'renders/{self.c.steps}/render']
 
             real_pred = self.discriminator(x)
             fake_pred = self.discriminator(samples)
@@ -242,7 +282,8 @@ def get_dataloader(c):
 
     return dataloader
 
-def accumulate_gradients(modules, world_size):
+def accumulate_gradients(modules, c):
+    world_size = c.world_size
     if not (world_size > 1):
         return 
      
@@ -255,7 +296,8 @@ def accumulate_gradients(modules, world_size):
         dist.all_reduce(flat, dist.ReduceOp.SUM)
         flat /= world_size
 
-        torch.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+        torch.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)        
+        
         grads = flat.split([param.numel() for param in params])
         for param, grad in zip(params, grads):
             param.grad = grad.reshape(param.shape)
@@ -263,11 +305,16 @@ def accumulate_gradients(modules, world_size):
         del flat, grads
     del params
 
+    for module in modules:
+        torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
+
 def plot_training_progress(generator, noise, c):
+    noise_generator = torch.randn if c.use_noise else torch.zeros
     size = c.feature_volume_size
     # Plot everything (generated samples, masks, sprites, textures, ....)
     with torch.no_grad():
-        output = generator(torch.randn_like(noise[:8]), size, steps=c.steps, mode='decode', render_every_step=True)
+        input_noise = [noise_generator(8, *_noise.shape[1:], device=c.device) for _noise in generator.to_rgb.get_noise_like()]
+        output = generator(torch.randn_like(noise[:8]), size, steps=c.steps, noise=input_noise, mode='decode', render_every_step=True)
         masks = output[f'renders/{c.steps}/masks']
         sprites = output[f'renders/{c.steps}/sprites']
         textures = output[f'renders/{c.steps}/textures']
@@ -283,7 +330,7 @@ def plot_training_progress(generator, noise, c):
 
             for k in range(c.steps + 1):
                 # Renders
-                axes[row_idx * 4 + 0, col_idx * (c.steps + 1) + k].imshow(((output[f'renders/{k}/render'].permute(0, 2,3, 1) + 1) / 2)[idx].cpu().detach().numpy())
+                axes[row_idx * 4 + 0, col_idx * (c.steps + 1) + k].imshow(torch.clamp((output[f'renders/{k}/render'].permute(0, 2, 3, 1) + 1) / 2, 0, 1)[idx].cpu().detach().numpy())
                 axes[row_idx * 4 + 0, col_idx * (c.steps + 1) + k].title.set_text(f'Render @ Step {k}')
 
                 # Sprites
@@ -304,14 +351,16 @@ def plot_training_progress(generator, noise, c):
                     axes[row_idx * 4 + 2, col_idx * (c.steps + 1) + k].title.set_text(f'Mask @ Step {k}')
 
                 # Texture
+
                 if k > 0:
-                    axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].imshow(((textures[idx, ..., k-1, :3] + 1) / 2).cpu().detach().numpy())
+                    axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].imshow(torch.clamp((textures[idx, ..., k-1, :3] + 1) / 2, 0, 1).cpu().detach().numpy())
                     axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].title.set_text(f'Texture @ Step {k}')
                 else:
-                    axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].imshow(((textures[idx, ..., -1, :3] +1) / 2).cpu().detach().numpy())
+                    axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].imshow(torch.clamp((textures[idx, ..., -1, :3] +1) / 2, 0, 1).cpu().detach().numpy())
                     axes[row_idx * 4 + 3, col_idx * (c.steps + 1) + k].title.set_text(f'Texture @ Step {k}')
 
         wandb.log({"Construction timeline": fig}, step=c.global_step)
+        plt.clf()
         plt.close()
         del output, masks, sprites, textures, centers
 
@@ -319,32 +368,38 @@ def plot_training_progress(generator, noise, c):
     with torch.no_grad():
         samples = []
         for j in range(8):
-            generator_output = generator(noise[j * 8: j * 8 + 8], size, steps=c.steps, mode='decode')
+            input_noise = 'const' if c.use_noise else None
+            generator_output = generator(noise[j * 8: j * 8 + 8], size, steps=c.steps, noise=input_noise, mode='decode')
             samples.append(
-                ((generator_output[f'renders/{c.steps}/render'] + 1) / 2).permute(0, 2, 3, 1).cpu()
+                torch.clamp((generator_output[f'renders/{c.steps}/render'] + 1) / 2, 0, 1).permute(0, 2, 3, 1).cpu()
             )
-            del generator_output
         samples = torch.cat(samples, dim=0).numpy()
         plot_samples(samples, 8, 8, show=False)
         wandb.log({'Generated Samples': plt}, step=c.global_step)
+        plt.clf()
         plt.close()
         del samples
 
+    gc.collect()
     for _ in range(5):
-        gc.collect()
         torch.cuda.empty_cache()       
+
+    import os, psutil; print(psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2, flush=True)
 
 def training_loop(c):
     torch.backends.cudnn.benchmark = True               # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
 
+
+    print(torch.cuda.nccl.version(), flush=True)
+
     # Load training data
     dataloader = get_dataloader(c)
 
     # Instantiate generator and discriminator
     generator = MultiShapeStyleLinearApproach(**c.G_args).to(c.device)
-    my_regularizer = MyRegularizer(c.G_args.shape_style_dim, final_activation=nn.Tanh()).to(c.device)
+    my_regularizer = MyRegularizer(c.G_args.shape_style_dim, generator.to_rgb.num_layers, final_activation=None).to(c.device)
     discriminator = StyleGANDiscriminator(c.G_args.output_size, in_channels=3, channel_multiplier=1).to(c.device)
     generator_ema = copy.deepcopy(generator).eval()
 
@@ -390,7 +445,7 @@ def training_loop(c):
     # Setup logging
     if c.rank == 0:
         os.environ["WANDB_START_METHOD"] = "thread"
-        wandb.init(project="my-test-project", entity="amsabour", resume="allow", dir=c.save_dir, id=c.job_id, settings=dict(start_method='thread'))
+        wandb.init(project="my-test-project", entity="amsabour", resume="allow", dir=c.save_dir) # , id=c.job_id)
         wandb.config.update(c, allow_val_change=True)
     
 
@@ -398,6 +453,11 @@ def training_loop(c):
     plot_start_global_step = c.global_step
     snap_start_global_step = c.global_step
     noise = torch.randn(64, c.G_args.hidden_dim).to(c.device)
+
+    if c.global_step < c.progressive_start_unlock_kimg * 1000:
+        generator.assembler.shape_library.requires_grad_(False)
+        # generator.assembler.texture_library.requires_grad_(False)
+        
 
     while c.global_step < c.kimg * 1000:
         for i, (x, _) in enumerate(dataloader):
@@ -411,15 +471,20 @@ def training_loop(c):
             # G Step
             if i % 1 == 0:
                 generator.requires_grad_(True)
+                if c.global_step < c.progressive_start_unlock_kimg * 1000:
+                    generator.assembler.shape_library.requires_grad_(False)
+                    # generator.assembler.texture_library.requires_grad_(False)
+                
                 my_regularizer.requires_grad_(True)
                 discriminator.requires_grad_(False)
 
                 optimizerG.zero_grad(set_to_none=True)
                 start_G = time.time()
                 for xx in torch.chunk(x, c.num_batch_splits, dim=0): 
-                    loss.accumulate_gradients('G', xx, gain=1, log=(i % 1 == 0))
+                    loss.accumulate_gradients('G', xx, gain=1 / c.num_batch_splits, log=(i % 1 == 0))
                 end_G = time.time()
-                accumulate_gradients([generator, my_regularizer], c.world_size)
+                accumulate_gradients([generator, my_regularizer], c)
+                log_wandb({'Gradients/G_grad_norm': get_grad_norm([generator])}, c)
                 end_G_acc = time.time()
                 optimizerG.step()
                 end_G_opt = time.time()
@@ -433,15 +498,20 @@ def training_loop(c):
             # G reg step
             if i % c.g_reg_every == 0:
                 generator.requires_grad_(True)
+                if c.global_step < c.progressive_start_unlock_kimg * 1000:
+                    generator.assembler.shape_library.requires_grad_(False)
+                    # generator.assembler.texture_library.requires_grad_(False)
+
                 my_regularizer.requires_grad_(False)
                 discriminator.requires_grad_(False)
                 
                 optimizerG.zero_grad(set_to_none=True)
                 start_G_reg = time.time()
                 for xx in torch.chunk(x, c.num_batch_splits, dim=0): 
-                    loss.accumulate_gradients('G_reg', xx, gain=c.g_reg_every, log=True)
+                    loss.accumulate_gradients('G_reg', xx, gain=c.g_reg_every / c.num_batch_splits, log=True)
                 end_G_reg = time.time()
-                accumulate_gradients([generator], c.world_size)
+                accumulate_gradients([generator], c)
+                log_wandb({'Gradients/G_reg_grad_norm': get_grad_norm([generator])}, c)
                 end_G_reg_acc = time.time()
                 optimizerG.step()
                 end_G_reg_opt = time.time()
@@ -461,9 +531,10 @@ def training_loop(c):
                 optimizerD.zero_grad(set_to_none=True)
                 start_D = time.time()
                 for xx in torch.chunk(x, c.num_batch_splits, dim=0): 
-                    loss.accumulate_gradients('D', xx, gain=1, log=(i % 1 == 0))
+                    loss.accumulate_gradients('D', xx, gain=1 / c.num_batch_splits, log=(i % 1 == 0))
                 end_D = time.time()
-                accumulate_gradients([discriminator], c.world_size)
+                accumulate_gradients([discriminator], c)
+                log_wandb({'Gradients/D_grad_norm': get_grad_norm([discriminator])}, c)
                 end_D_acc = time.time()
                 optimizerD.step()
                 end_D_opt = time.time()
@@ -483,9 +554,10 @@ def training_loop(c):
                 optimizerD.zero_grad()
                 start_D_reg = time.time()
                 for xx in torch.chunk(x, c.num_batch_splits, dim=0):
-                    loss.accumulate_gradients('D_reg', xx, gain=c.d_reg_every, log=True)
+                    loss.accumulate_gradients('D_reg', xx, gain=c.d_reg_every / c.num_batch_splits, log=True)
                 end_D_reg = time.time()
-                accumulate_gradients([discriminator], c.world_size)
+                accumulate_gradients([discriminator], c)
+                log_wandb({'Gradients/D_reg_grad_norm': get_grad_norm([discriminator])}, c)
                 end_D_reg_acc = time.time()    
                 optimizerD.step()
                 end_D_reg_opt = time.time()
@@ -499,6 +571,9 @@ def training_loop(c):
             # Update progressive librarires
             start_progressive = time.time()
             if c.global_step > c.progressive_start_unlock_kimg * 1000:
+                generator.assembler.shape_library.requires_grad_(True)
+                # generator.assembler.texture_library.requires_grad_(True)
+
                 generator.assembler.shape_library.step(c.batch_size / (c.shape_progressive_unlock_kimg * 1000))
                 generator.assembler.texture_library.step(c.batch_size / (c.texture_progressive_unlock_kimg * 1000))
             end_progressive = time.time()
@@ -513,12 +588,12 @@ def training_loop(c):
             ema_accumulate(generator_ema, generator, ema_beta)
             end_ema = time.time()
             log_wandb({'Timings/ema_update': end_ema - start_ema} ,c)
-
+            
             if c.rank == 0:
                 wandb.log({"commited": True}, step=c.global_step)
                     
                 # Plot samples and reconstructions
-                if (c.global_step - plot_start_global_step) > c.plot * 1000:
+                if (c.global_step - plot_start_global_step) > c.plot * 1000 or c.global_step == c.batch_size:
                     plot_start_global_step = c.global_step
                     plot_training_progress(generator_ema, noise, c)
                     
@@ -551,6 +626,7 @@ def training_loop(c):
 @click.option('--non-useless-weight', help='Non useless regularization weight', metavar='FLOAT',        type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--non-empty-weight',   help='Non empty regularization weight',   metavar='FLOAT',        type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--pl-weight',          help='Path length regularization weight', metavar='FLOAT',        type=click.FloatRange(min=0), default=2, show_default=True)
+@click.option('--complexity-weight',  help='Sprite complexity regularization weight', metavar='FLOAT',  type=click.FloatRange(min=0), default=0, show_default=True)
 
 
 # Generator hyperparameters
@@ -568,6 +644,10 @@ def training_loop(c):
 @click.option('--use-textures',                         help='Use texture fields or not',          metavar='BOOL',         type=bool, default=True, show_default=True)
 @click.option('--decoder-const-in',                     help='Use constant input in the StyleDecoder', metavar='BOOL',     type=bool, default=True, show_default=True)
 @click.option('--decoder-size-in',                      help='The resolution of input in the StyleDecoder',                type=click.Choice(['2', '4', '8', '16', '32', '64']), default=4, show_default=True)
+@click.option('--decoder-c-model',                      help='The width of the StyleDecoder',                              type=click.IntRange(min=16), default=32, show_default=True)
+
+
+@click.option('--use-noise',                            help='Use per-pixel noise injections', metavar='BOOL',             type=bool, default=False, show_default=True)
 
 @click.option('--shape-progressive-unlock-kimg',        help='Number of KIMG needed to fully unlock shapes', metavar='INT',       
               type=click.IntRange(min=0), default=100, show_default=True)
@@ -578,10 +658,8 @@ def training_loop(c):
 
 
 
-@click.option('--detach-features-t1-train',             help='Stop gradient during T1 training', metavar='BOOL',         type=bool, default=True, show_default=True)
 
-
-@click.option('--steps',                                help='Number of sprites', metavar='INT',                           type=click.IntRange(min=1), default=3, show_default=True)
+@click.option('--steps',        help='Number of sprites', metavar='INT',                           type=click.IntRange(min=0), default=6, show_default=True)
 # Misc hyperparameters.
 @click.option('--glr',          help='G learning rate', metavar='FLOAT',                           type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                           type=click.FloatRange(min=0), default=0.002, show_default=True)
@@ -596,8 +674,6 @@ def training_loop(c):
 @click.option('--snap',         help='How often to save snapshots', metavar='KIMG',             type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 def main(**kwargs):
-
-    torch.autograd.set_detect_anomaly(True)
 
     ################ Setup Config ################  
     opts = dnnlib.EasyDict(kwargs)  # Command line arguments.
@@ -632,6 +708,7 @@ def main(**kwargs):
     c.non_useless_weight = opts.non_useless_weight
     c.non_empty_weight = opts.non_empty_weight
     c.pl_weight = opts.pl_weight
+    c.complexity_weight = opts.complexity_weight
 
     c.G_args = dnnlib.EasyDict()
     c.G_args.hidden_dim = opts.hidden_dim
@@ -650,14 +727,15 @@ def main(**kwargs):
     c.feature_volume_size = int(opts.feature_volume_size)
     c.G_args.const_in = opts.decoder_const_in
     c.G_args.size_in = int(opts.decoder_size_in)
-    
-    
+    c.G_args.c_model = opts.decoder_c_model
+
     c.steps = opts.steps
     c.shape_progressive_unlock_kimg = opts.shape_progressive_unlock_kimg
     c.texture_progressive_unlock_kimg = opts.texture_progressive_unlock_kimg
     c.progressive_start_unlock_kimg = opts.progressive_start_unlock_kimg
     c.ema_kimg = opts.ema_kimg
     c.ema_rampup = opts.ema_rampup
+    c.use_noise = opts.use_noise
 
     c.generator_lr = opts.glr
     c.discriminator_lr = opts.dlr
@@ -681,4 +759,11 @@ def main(**kwargs):
     training_loop(c)
 
 if __name__ == "__main__":
-    main()  # pylint: disable=no-value-for-parameter
+    try:
+        main() 
+    except:
+        print("Something went wrong!")
+        traceback.print_exc()
+        wandb.finish()
+        dist.destroy_process_group()
+        sys.exit(1)

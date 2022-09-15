@@ -181,7 +181,6 @@ class EqualLinear(nn.Module):
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_dim).fill_(bias_init))
-
         else:
             self.bias = None
 
@@ -208,6 +207,40 @@ class EqualLinear(nn.Module):
         return (
             f"{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]}, {'' if self.bias is not None else 'no '}bias, lr_mul={self.lr_mul}, act={self.activation})"
         )
+
+class LipEqualLinear(EqualLinear):
+    def __init__(
+            self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None
+    ):
+        super().__init__(in_dim, out_dim, bias=bias, bias_init=bias_init, lr_mul=lr_mul, activation=activation)
+        self.c = nn.Parameter(torch.sum(torch.abs(self.weight * self.scale), dim=1).max())
+
+    def get_normalized_weights(self):
+        """
+        Lipschitz weight normalization based on the L-infinity norm
+        """
+        weights = self.weight * self.scale
+        absrowsum = torch.sum(torch.abs(weights), dim=1)
+        scale = torch.minimum(torch.tensor(1.0).type_as(self.c), F.softplus(self.c) / absrowsum)
+        return weights * scale[:,None]
+
+    def forward(self, input):
+        assert input.shape[-1] == self.weight.shape[-1], \
+            f'Input shape {input.shape[-1]} != weight shape {self.weight.shape[-1]}'
+
+        # Normalize weights
+        weights = self.get_normalized_weights()
+
+        if self.activation:
+            out = F.linear(input, weights) 
+            out = fused_leaky_relu(out, self.bias * self.lr_mul)
+        else:
+            out = F.linear(
+                input, weights, bias=self.bias * self.lr_mul if self.bias is not None else None
+            )
+        
+        return out
+
 
 
 class ModulatedConv2d(nn.Module):

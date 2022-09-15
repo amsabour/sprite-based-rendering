@@ -4,6 +4,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from .op import FusedLeakyReLU, conv2d_gradfix
 
@@ -128,9 +129,24 @@ class SpatialModulatedConv2d(nn.Module):
         size = height
 
         if spatial_style:
-            style = F.interpolate(style, (size, size), mode='bilinear', align_corners=False)
-            # style is [N, D_style, H, W] --> [N, in_channels, H, W]
-            style = self.modulation(style.permute(0, 2, 3, 1).flatten(end_dim=1)).view(style.shape[0], style.shape[2], style.shape[3], -1).permute(0, 3, 1, 2)
+            if isinstance(style, dict):
+                masks = style['masks'] # [batch_size, H, W, num_shapes+1]
+                masks = F.interpolate(rearrange(masks, 'b H W s -> b s H W'), (size, size), mode='bilinear', align_corners=False)
+
+                textures = style['textures'] # [batch_size, H, W, num_shapes+1, shape_style_dim]
+                num_textures = textures.shape[-2]
+                texture_dim = textures.shape[-1]
+                textures = F.interpolate(rearrange(textures, 'b H W s d -> b (s d) H W'), (size, size), mode='bilinear', align_corners=False)
+                textures = rearrange(textures, 'b (s d) H W -> b (H W s) d', s=num_textures, d=texture_dim)
+                textures = rearrange(self.modulation(textures), 'b (H W s) d -> b d s H W', H=size, W=size, s=num_textures)
+                
+                style = (masks[:, None] * textures).sum(dim=2)
+            else:
+                # Interpolate 
+                style = F.interpolate(style, (size, size), mode='bilinear', align_corners=False)
+
+                # style is [N, D_style, H, W] --> [N, in_channels, H, W]
+                style = self.modulation(style.permute(0, 2, 3, 1).flatten(end_dim=-2)).view(style.shape[0], style.shape[2], style.shape[3], -1).permute(0, 3, 1, 2)
 
             if self.demodulate:
                 style = style * torch.rsqrt(style.pow(2).mean([1], keepdim=True) + 1e-8)
