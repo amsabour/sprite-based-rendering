@@ -23,6 +23,8 @@ class PixelNorm(nn.Module):
 def pixel_norm(x):
     return x * torch.rsqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-5)
 
+def normalize_2nd_moment(x, dim=1, eps=1e-8):
+    return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
 
 def make_kernel(k):
     k = torch.tensor(k, dtype=torch.float32)
@@ -186,7 +188,7 @@ class EqualLinear(nn.Module):
 
         self.activation = activation
 
-        self.scale = (1 / math.sqrt(in_dim)) * lr_mul
+        self.scale = lr_mul / math.sqrt(in_dim)
         self.lr_mul = lr_mul
 
     def forward(self, input):

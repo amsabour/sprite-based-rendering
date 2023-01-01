@@ -8,7 +8,7 @@ from einops import rearrange
 
 from .op import FusedLeakyReLU, conv2d_gradfix
 
-from .stylegan import PixelNorm, EqualLinear, ConstantInput, Blur, NoiseInjection, Upsample
+from .stylegan import PixelNorm, EqualLinear, ConstantInput, Blur, NoiseInjection, Upsample, normalize_2nd_moment
 
 
 class SpatialToRGB(nn.Module):
@@ -131,25 +131,24 @@ class SpatialModulatedConv2d(nn.Module):
         if spatial_style:
             if isinstance(style, dict):
                 masks = style['masks'] # [batch_size, H, W, num_shapes+1]
-                masks = F.interpolate(rearrange(masks, 'b H W s -> b s H W'), (size, size), mode='bilinear', align_corners=False)
+                masks = F.interpolate(rearrange(masks, 'b H W s -> b s H W'), (size, size), mode='bilinear', align_corners=False)#, antialias=True)
 
                 textures = style['textures'] # [batch_size, H, W, num_shapes+1, shape_style_dim]
-                num_textures = textures.shape[-2]
-                texture_dim = textures.shape[-1]
-                textures = F.interpolate(rearrange(textures, 'b H W s d -> b (s d) H W'), (size, size), mode='bilinear', align_corners=False)
-                textures = rearrange(textures, 'b (s d) H W -> b (H W s) d', s=num_textures, d=texture_dim)
-                textures = rearrange(self.modulation(textures), 'b (H W s) d -> b d s H W', H=size, W=size, s=num_textures)
+                H, W, num_textures, _ = textures.shape[1:]
+                textures = self.modulation(rearrange(textures, 'b H W s d -> (b H W s) d')) # Apply modulation first to save memory
+                textures = rearrange(textures, '(b H W s) d -> b (s d) H W', s=num_textures, H=H, W=W)
+                textures = rearrange(F.interpolate(textures, (size, size), mode='bilinear'), 'b (s d) H W -> b d s H W', s=num_textures)
                 
-                style = (masks[:, None] * textures).sum(dim=2)
+                style = (masks.unsqueeze(1) * textures).sum(dim=2)
             else:
                 # Interpolate 
-                style = F.interpolate(style, (size, size), mode='bilinear', align_corners=False)
+                style = F.interpolate(style, (size, size), mode='bilinear', align_corners=False)#, antialias=True)
 
                 # style is [N, D_style, H, W] --> [N, in_channels, H, W]
                 style = self.modulation(style.permute(0, 2, 3, 1).flatten(end_dim=-2)).view(style.shape[0], style.shape[2], style.shape[3], -1).permute(0, 3, 1, 2)
 
             if self.demodulate:
-                style = style * torch.rsqrt(style.pow(2).mean([1], keepdim=True) + 1e-8)
+                style = normalize_2nd_moment(style, dim=1)
         else:
             style = self.modulation(style).reshape(batch, in_channel, 1, 1)
         

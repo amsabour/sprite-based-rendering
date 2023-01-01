@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 import os
 
 import warnings
-
+from typing import Any, Tuple
+from PIL import Image
 
 
 def is_rank_zero():
@@ -44,6 +45,44 @@ class CustomImageFolder(torchvision.datasets.ImageFolder):
         output = super().__getitem__(index)
         self.loaded_samples[index] = output
         return output
+
+
+class CustomImageFolder2(torchvision.datasets.ImageFolder):
+    def __init__(self, root, image_size, center_crop):
+        super().__init__(root, transform=None)
+        self.image_size = image_size
+        self.center_crop = center_crop
+
+    def center_crop(self, im):
+        new_width, new_height = (self.center_crop, self.center_crop)
+        width, height = im.size   # Get dimensions
+
+        left = round((width - new_width)/2)
+        top = round((height - new_height)/2)
+        x_right = round(width - new_width) - left
+        x_bottom = round(height - new_height) - top
+        right = width - x_right
+        bottom = height - x_bottom
+
+        # Crop the center of the image
+        im = im.crop((left, top, right, bottom))
+        return im
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        path, target = self.samples[index]
+
+        with open(path, 'rb') as f:
+            sample = Image.open(f).convert('RGB')
+            sample = self.center_crop(sample)
+            sample = sample.resize((self.image_size, self.image_size), Image.LANCZOS)
+            sample = (np.asarray(sample).reshape(1, self.image_size, self.image_size, 3).astype('float32') - 127.5) / 127.5
+            sample = torch.from_numpy(sample[0, :, :, :]).permute(2, 0, 1)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        
+        return sample, target
+
     
 def create_linspace(begin=-1, end=1, H=64, W=64, as_center_points=False):
     if as_center_points:
@@ -364,7 +403,7 @@ class SlotAttention(nn.Module):
             slots = slots + self.mlp(self.norm_pre_ff(slots))
 
         return slots, attn
-def compute_entropy(x, eps=1e-6):
+def compute_entropy(x, eps=1e-6, dim=-1):
     """
     Args:
         x: FloatTensor of shape [..., N] with non-negative values. 
@@ -375,8 +414,8 @@ def compute_entropy(x, eps=1e-6):
         warnings.warn("Warning: Negative values found in compute_entropy(). Clamping to 0")
     
     x = F.relu(x) # Get rid of non-negatives
-    x = x / (x.sum(dim=-1, keepdim=True) + eps)
-    output = (-x * torch.log(x + eps)).sum(dim=-1)
+    x = x / (x.sum(dim=dim, keepdim=True) + eps)
+    output = (-x * torch.log(x + eps)).sum(dim=dim)
     return output
 
 class ScaleNorm(nn.Module):
@@ -392,17 +431,22 @@ def get_grad_norm(modules):
     params = []
     for module in modules:
         params += [param for param in module.parameters() if param.grad is not None]
+    
+    if len(params) == 0:
+        return torch.zeros(1, device=list(modules[0].parameters())[0].device)
+
     grad = torch.cat([param.grad.flatten() for param in params])
     return torch.linalg.norm(grad)
-
-    # total_norm = 0.0
-    # for p in model.parameters():
-    #     param_norm = p.grad.detach().data.norm(2)
-    #     total_norm += param_norm.item() ** 2
-    # total_norm = total_norm ** 0.5
-    # return total_norm
-
 
 def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
+
+
+def random_subset(x):
+    in_subset = (np.random.uniform(size=len(x)) < 0.5)
+    return [x[i] for i in range(len(x)) if in_subset[i]]
+
+
+def linear_scale(inputs, new_min, new_max, old_min=-1, old_max=1):
+    return ((inputs - old_min) / (max(old_max - old_min, 1e-6))) * (new_max - new_min) + new_min
